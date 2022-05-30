@@ -6,9 +6,14 @@ from collections import Counter
 from pymatgen.core.structure import Structure
 from pymatgen.core.periodic_table import Element
 
+from scipy.optimize import linear_sum_assignment
+from sklearn.cluster import KMeans
+from sklearn.metrics.cluster import contingency_matrix
+
 from mendeleev.fetch import fetch_table
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import precision_recall_fscore_support, roc_curve, auc
+from sklearn.utils import class_weight
 
 from plot_imports import *
 from periodic_table import fetch_table
@@ -70,6 +75,117 @@ def load_data(data_path, num_classes=2):
     return data, species
 
 
+def build_data(data, species, idx, spec_col='spectra_abs'):
+    Z = [Element(specie).Z for specie in species]
+    height = len(list(data.iloc[0]['spectra'].values())[0]['x'])
+    width = max(Z)
+
+    # initialize array
+    xdata = np.zeros((len(idx), height, width))            # element-encoded spectra
+    ydata = np.zeros((len(idx), 1))                        # class
+    edata = np.zeros((len(idx), width), dtype=int)         # one-hot encoded elements
+
+    # build xdata
+    for i, entry in enumerate(data.loc[idx].itertuples()):
+        ydata[i,:] = entry.class_true
+        xas_dict = eval('entry.' + spec_col)
+        struct = entry.structure
+        for j, site in enumerate(struct):
+            xdata[i,:,site.specie.Z - 1] = xas_dict[str(site.specie)]['y']
+            edata[i,site.specie.Z - 1] = 1
+
+    # define type encoding
+    type_encoding = ['' for _ in range(width)]
+    for z in range(1, width + 1):
+        specie = Element.from_Z(z)
+        type_encoding[z-1] = specie.symbol
+
+    return xdata, ydata, edata, type_encoding
+
+
+class standardXAS:
+    def __init__(self, ne):
+        self.ne = ne
+        self.mu = np.zeros(ne)
+        self.s = np.ones(ne)
+    
+    def fit(self, x, e):
+        for elem in range(self.ne):
+            mask = e[:,elem].ravel() == 1
+            if np.sum(e[:,elem]) > 1:
+                mu = np.mean(x[mask,:,elem], axis=1)
+                s = np.std(x[mask,:,elem], axis=1)
+                self.mu[elem] = np.mean(mu)
+                self.s[elem] = np.mean(s)
+            elif np.sum(e[:,elem]) == 1: # only one sample exists
+                self.mu[elem] = np.mean(x[mask,:,elem])
+                self.s[elem] = 1.
+            else: # no samples exist
+                self.mu[elem] = 0.
+                self.s[elem] = 1.
+                
+    def transform(self, x, e):
+        for elem in range(self.ne):
+            mask = e[:,elem].ravel() == 1
+            x[mask,:,elem] -= self.mu[elem]
+            x[mask,:,elem] /= self.s[elem]
+
+    def fit_transform(self, x, e):
+        self.fit(x,e)
+        self.transform(x,e)
+        
+
+class clusterXAS:
+    def __init__(self, n_clusters):
+        self.n_clusters = n_clusters
+        self.kmeans = KMeans(init='k-means++', n_clusters=n_clusters, n_init=10)
+
+    def remove_outliers(self, x, y, frac, min_size=4):
+        mu = np.mean(x, axis=0)
+        d = np.sqrt(np.sum(np.square(x - mu),axis=1))
+        idx = np.argsort(d)
+        n = len(idx); f = 1.
+        while n > min_size and f > frac:
+            n -= 1
+            f = n/float(len(x))
+        xf = np.copy(x[idx[:n]])
+        yf = np.copy(y[idx[:n]])
+        return xf, yf
+    
+    def _cluster_matching_fit(self, y):
+        if len(np.unique(y)) > 1:
+            class_weights = dict(enumerate(class_weight.compute_class_weight(
+                            'balanced',classes=np.unique(y),y=y)))
+        else:
+            class_weights = {0:1.,1:1.}
+        yp = self.kmeans.labels_
+        cmat = contingency_matrix(y, yp).astype(np.float)
+        
+        # apply class weights:
+        for i in range(len(cmat)):
+            cmat[i] *= class_weights[i]
+            row, col = linear_sum_assignment(-cmat)
+        self.cmat = cmat
+        self.row = row
+        self.col = col
+        
+    def _cluster_matching_predict(self, x):
+        order = [0,1]
+        y = self.kmeans.predict(x)
+        n = len(y)
+        c = np.zeros(n)
+        for i in range(n):
+            c[i] = order[self.col[order.index(y[i])]]
+        return c
+
+    def fit(self, x, y):
+        self.kmeans.fit(x)
+        self._cluster_matching_fit(y)
+
+    def predict(self, x):
+        return self._cluster_matching_predict(x)
+    
+    
 def train_valid_test_split(data, species, valid_size=0.15, test_size=0.15, seed=12):
     ''' data - dataframe of materials examples
         species - list of distinct atomic species

@@ -7,6 +7,10 @@ from bokeh.io import export_png, export_svgs
 from bokeh.models import ColumnDataSource, ColorBar, LogColorMapper, LogTicker, LinearColorMapper
 from bokeh.core.properties import value
 
+from selenium import webdriver
+import geckodriver_autoinstaller
+geckodriver_autoinstaller.install()
+
 import matplotlib as mpl
 import matplotlib.colors as colors
 
